@@ -29,6 +29,7 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <stack>
 #include <cstring>
 #include <jnif.hpp>
 #include "jvm.hpp"
@@ -340,7 +341,7 @@ ReapplyClass(jclass clazz, std::string clazz_name)
                     copyflags |= Method::STATIC;
                 }
 
-                auto deleteLNT = [](CodeAttr* orig_ca) {
+                static auto deleteLNT = [](CodeAttr* orig_ca) {
                     // remove line number table
                     for (size_t i = 0; i < orig_ca->attrs.size(); i++) {
                         if (orig_ca->attrs.attrs[i]->kind == ATTR_LNT) {
@@ -349,7 +350,7 @@ ReapplyClass(jclass clazz, std::string clazz_name)
                     }
                 };
                 
-                auto deleteNextInsts = [](InstList::Iterator& iterator) {
+                static auto deleteNextInsts = [](InstList::Iterator& iterator) {
                     // from JNIF model.cpp InstList::~InstList()
                     for (Inst* inst = iterator->next; inst != nullptr;) {
                         Inst* next = inst->next;
@@ -357,6 +358,19 @@ ReapplyClass(jclass clazz, std::string clazz_name)
                         inst = next;
                     }
                     iterator->next = nullptr;
+                };
+
+                static auto getCodeIndex = [](const jnif::model::Attr& attr) {
+                    for (ConstPool::Iterator it = attr.constPool->iterator(); it.hasNext(); it++) {
+                        ConstPool::Index i = *it;
+                        ConstPool::Tag tag = attr.constPool->getTag(i);
+                        if (tag == 1) {
+                            std::string bytes = attr.constPool->getUtf8(i);
+                            if (bytes == "Code") {
+                                return i;
+                            }
+                        }
+                    }
                 };
 
                 // constructor hook
@@ -371,18 +385,7 @@ ReapplyClass(jclass clazz, std::string clazz_name)
                     for (size_t i = 0; i < method.attrs.size(); ++i) {
                         auto& attr = method.attrs[i];
                         if (attr.kind == ATTR_CODE) {
-                            u2 code_nameindex = 0;
-                            // get index of "Code" from ConstPool
-                            for (ConstPool::Iterator it = attr.constPool->iterator(); it.hasNext(); it++) {
-                                ConstPool::Index i = *it;
-                                ConstPool::Tag tag = attr.constPool->getTag(i);
-                                if (tag == ConstPool::Tag::UTF8) {
-                                    std::string bytes = attr.constPool->getUtf8(i);
-                                    if (bytes == "Code") {
-                                        code_nameindex = i;
-                                    }
-                                }
-                            }
+                            auto code_nameindex = getCodeIndex(attr);
 
                             CodeAttr* ca = cf->_arena.create<CodeAttr>(code_nameindex, cf.get());
                             CodeAttr* orig_ca = ((CodeAttr*)&attr);
@@ -520,31 +523,427 @@ ReapplyClass(jclass clazz, std::string clazz_name)
                         n-each instruction is +1
                     */
                     auto& nativeMethod = cf->addMethod(newName.c_str(), descriptor, copyflags);
-                    
                     for (size_t i = 0; i < method.attrs.size(); ++i) {
                         auto& attr = method.attrs[i];
                         nativeMethod.attrs.add((Attr*)&attr); // native method should inherit all the attributes
                         if (attr.kind == ATTR_CODE) {
                             nativeMethod.attrs.remove(i);
-                            u2 code_nameindex = 0;
-                            // get index of "Code" from ConstPool
-                            for (ConstPool::Iterator it = attr.constPool->iterator(); it.hasNext(); it++) {
-                                ConstPool::Index i = *it;
-                                ConstPool::Tag tag = attr.constPool->getTag(i);
-                                if (tag == 1) {
-                                    std::string bytes = attr.constPool->getUtf8(i);
-                                    if (bytes == "Code") {
-                                        code_nameindex = i;
-                                    }
-                                }
-                            }
+                            u2 code_nameindex = getCodeIndex(attr);
 
                             CodeAttr* orig_ca = ((CodeAttr*)&attr);
                             InstList& instList = orig_ca->instList;
 
                             auto nativeMethodid = cf->addMethodRef(cf->thisClassIndex, newName.c_str(), descriptor);
+                            struct StackInfo {
+                                Opcode op;
+                                int opindex;
+                            };
+                            struct VariableInfo {
+                                Opcode op;
+                                int id;
+                            };
+                            static auto inRange = [](int value, int low, int high) {
+                                return value >= low and value <= high;
+                                };
+
+                            std::stack<StackInfo> stack;
+                            std::map<std::string, std::vector<VariableInfo>> variables ;
+                            int counter = 0;
+                            //todo fix pop2 dup2 etc
+                            for (auto i = instList.begin(); i != instList.end(); i.operator++()) {
+                                auto* inst = i.operator*();
+                                Opcode opcode = (inst->opcode);
+                                switch (opcode) {
+                                case Opcode::wide:
+                                    opcode = inst->wide()->subOpcode;                                
+                                case Opcode::bipush:
+                                case Opcode::sipush:
+
+                                case Opcode::aload:
+                                case Opcode::aload_0:
+                                case Opcode::aload_1:
+                                case Opcode::aload_2:
+                                case Opcode::aload_3:
+                                case Opcode::NEW:
+                                case Opcode::aconst_null:
+                                case Opcode::getstatic:
+
+                                case Opcode::iload:
+                                case Opcode::iload_0:
+                                case Opcode::iload_1:
+                                case Opcode::iload_2:
+                                case Opcode::iload_3:
+                                case Opcode::iconst_m1:
+                                case Opcode::iconst_0:
+                                case Opcode::iconst_1:
+                                case Opcode::iconst_2:
+                                case Opcode::iconst_3:
+                                case Opcode::iconst_4:
+                                case Opcode::iconst_5:
+
+                                case Opcode::fload:
+                                case Opcode::fload_0:
+                                case Opcode::fload_1:
+                                case Opcode::fload_2:
+                                case Opcode::fload_3:
+                                case Opcode::fconst_0:
+                                case Opcode::fconst_1:
+                                case Opcode::fconst_2:
+
+                                case Opcode::lload:
+                                case Opcode::lload_0:
+                                case Opcode::lload_1:
+                                case Opcode::lload_2:
+                                case Opcode::lload_3:
+                                case Opcode::lconst_0:
+                                case Opcode::lconst_1:
+
+                                case Opcode::dload:
+                                case Opcode::dload_0:
+                                case Opcode::dload_1:
+                                case Opcode::dload_2:
+                                case Opcode::dload_3:
+                                case Opcode::dconst_0:
+                                case Opcode::dconst_1:
+
+                                case Opcode::ldc:
+                                case Opcode::ldc_w:
+                                case Opcode::ldc2_w:
+
+                                case Opcode::jsr:
+                                case Opcode::jsr_w:
+                                    stack.push({ opcode,counter });
+                                    break;
+                                case Opcode::newarray:
+                                case Opcode::anewarray:
+                                case Opcode::getfield:
+                                case Opcode::checkcast:
+
+                                case Opcode::d2f:
+                                case Opcode::d2i:
+                                case Opcode::d2l:
+                                case Opcode::dneg:
+
+                                case Opcode::f2d:
+                                case Opcode::f2i:
+                                case Opcode::f2l:
+                                case Opcode::fneg:
+
+                                case Opcode::arraylength:
+                                case Opcode::i2b:
+                                case Opcode::i2c:
+                                case Opcode::i2d:
+                                case Opcode::i2f:
+                                case Opcode::i2l:
+                                case Opcode::i2s:
+                                case Opcode::ineg:
+                                case Opcode::instanceof:
+
+                                case Opcode::l2d:
+                                case Opcode::l2f:
+                                case Opcode::l2i:
+                                case Opcode::lneg:
+                                    stack.pop();
+                                    stack.push({ opcode,counter });
+                                    break;
+                                case Opcode::aaload:
+                                case Opcode::baload:
+                                case Opcode::caload:
+                                case Opcode::dadd:
+                                case Opcode::daload:
+                                case Opcode::dcmpg:
+                                case Opcode::dcmpl:
+                                case Opcode::ddiv:
+                                case Opcode::dmul:
+                                case Opcode::drem:
+                                case Opcode::dsub:
+                                case Opcode::fadd:
+                                case Opcode::faload:
+                                case Opcode::fcmpg:
+                                case Opcode::fcmpl:
+                                case Opcode::fdiv:
+                                case Opcode::fmul:
+                                case Opcode::frem:
+                                case Opcode::fsub:
+                                case Opcode::iadd:
+                                case Opcode::iaload:
+                                case Opcode::iand:
+                                case Opcode::idiv:
+                                case Opcode::imul:
+                                case Opcode::ior:
+                                case Opcode::irem:
+                                case Opcode::ishl:
+                                case Opcode::ishr:
+                                case Opcode::isub:
+                                case Opcode::iushr:
+                                case Opcode::ixor:
+                                case Opcode::ladd:
+                                case Opcode::laload:
+                                case Opcode::land:
+                                case Opcode::lcmp:
+                                case Opcode::ldiv:
+                                case Opcode::lmul:
+                                case Opcode::lor:
+                                case Opcode::lrem:
+                                case Opcode::lshl:
+                                case Opcode::lshr:
+                                case Opcode::lsub:
+                                case Opcode::lushr:
+                                case Opcode::lxor:
+                                case Opcode::saload:
+                                    stack.pop();
+                                    stack.pop();
+                                    stack.push({ opcode,counter });
+                                    break;
+                                case Opcode::dup:
+                                case Opcode::dup_x1:
+                                case Opcode::dup_x2:
+                                    stack.push({ opcode,counter });
+                                    break;
+                                case Opcode::dup2:
+                                case Opcode::dup2_x1:
+                                case Opcode::dup2_x2:
+                                    stack.push({ opcode,counter });
+                                    break;
+                                case Opcode::dreturn:
+                                case Opcode::freturn:
+                                case Opcode::ireturn:
+                                case Opcode::lreturn:
+                                case Opcode::areturn:
+                                case Opcode::RETURN:
+                                    while (!stack.empty()) {
+                                        stack.pop();
+                                    }
+                                    break;
+                                case Opcode::athrow:
+                                {
+                                    int size = stack.size();
+                                    while (!stack.empty()) {
+                                        stack.pop();
+                                    }
+                                    stack.push({ opcode,counter });
+                                    break;
+                                }
+                                case Opcode::astore:
+                                case Opcode::istore:
+                                case Opcode::dstore:
+                                case Opcode::fstore:
+                                case Opcode::lstore:
+                                case Opcode::astore_0:
+                                case Opcode::astore_1:
+                                case Opcode::astore_2:
+                                case Opcode::astore_3:
+                                case Opcode::istore_0:
+                                case Opcode::istore_1:
+                                case Opcode::istore_2:
+                                case Opcode::istore_3:
+                                case Opcode::fstore_0:
+                                case Opcode::fstore_1:
+                                case Opcode::fstore_2:
+                                case Opcode::fstore_3:
+                                case Opcode::lstore_0:
+                                case Opcode::lstore_1:
+                                case Opcode::lstore_2:
+                                case Opcode::lstore_3:
+                                case Opcode::dstore_0:
+                                case Opcode::dstore_1:
+                                case Opcode::dstore_2:
+                                case Opcode::dstore_3:
+                                {
+                                    stack.pop();
+
+                                    int op = (int)opcode;
+                                    
+                                    //object
+                                    if (opcode == Opcode::astore or inRange(op, (int)Opcode::astore_0, (int)Opcode::astore_3)) {
+                                        VariableInfo var{ opcode };
+                                        if (opcode == Opcode::astore) {
+                                            var.id = inst->var()->lvindex;
+                                        }
+                                        else {
+                                            var.id = op - (int)Opcode::astore_0;
+                                        }
+                                        for (auto v : variables["object"]) {
+                                            if (v.id == var.id) {
+                                                break;
+                                            }
+                                        }
+                                        variables["object"].push_back(var);
+                                    }
+                                    //int
+                                    else if (opcode == Opcode::istore or inRange(op, (int)Opcode::istore_0, (int)Opcode::istore_3)) {
+                                        VariableInfo var{ opcode };
+                                        if (opcode == Opcode::istore) {
+                                            var.id = inst->var()->lvindex;
+                                        }
+                                        else {
+                                            var.id = op - (int)Opcode::istore_0;
+                                        }
+                                        for (auto v : variables["int"]) {
+                                            if (v.id == var.id) {
+                                                break;
+                                            }
+                                        }
+                                        variables["int"].push_back(var);
+                                    }
+                                    //float
+                                    else if (opcode == Opcode::fstore or inRange(op, (int)Opcode::fstore_0, (int)Opcode::fstore_3)) {
+                                        VariableInfo var{ opcode };
+                                        if (opcode == Opcode::fstore) {
+                                            var.id = inst->var()->lvindex;
+                                        }
+                                        else {
+                                            var.id = op - (int)Opcode::fstore_0;
+                                        }
+                                        for (auto v : variables["float"]) {
+                                            if (v.id == var.id) {
+                                                break;
+                                            }
+                                        }
+                                        variables["float"].push_back(var);
+                                    }
+                                    //long
+                                    else if (opcode == Opcode::lstore or inRange(op, (int)Opcode::lstore_0, (int)Opcode::lstore_3)) {
+                                        VariableInfo var{ opcode };
+                                        if (opcode == Opcode::lstore) {
+                                            var.id = inst->var()->lvindex;
+                                        }
+                                        else {
+                                            var.id = op - (int)Opcode::fstore_0;
+                                        }
+                                        for (auto v : variables["long"]) {
+                                            if (v.id == var.id) {
+                                                break;
+                                            }
+                                        }
+                                        variables["long"].push_back(var);
+                                    }
+                                    //double
+                                    else if (opcode == Opcode::dstore or inRange(op, (int)Opcode::dstore_0, (int)Opcode::dstore_3)) {
+                                        VariableInfo var{ opcode };
+                                        if (opcode == Opcode::dstore) {
+                                            var.id = inst->var()->lvindex;
+                                        }
+                                        else {
+                                            var.id = op - (int)Opcode::dstore_0;
+                                        }
+                                        for (auto v : variables["double"]) {
+                                            if (v.id == var.id) {
+                                                break;
+                                            }
+                                        }
+                                        variables["double"].push_back(var);
+                                    }
+                                    break;
+                                }
+                                case Opcode::ifeq:
+                                case Opcode::ifge:
+                                case Opcode::ifgt:
+                                case Opcode::ifle:
+                                case Opcode::iflt:
+                                case Opcode::ifne:
+                                case Opcode::ifnonnull:
+                                case Opcode::ifnull:
+                                case Opcode::lookupswitch:
+                                case Opcode::monitorenter:
+                                case Opcode::monitorexit:
+                                case Opcode::pop:
+                                case Opcode::putstatic:
+                                case Opcode::tableswitch:
+                                    stack.pop();
+                                    break;
+                                case Opcode::if_acmpeq:
+                                case Opcode::if_acmpne:
+                                case Opcode::if_icmpeq:
+                                case Opcode::if_icmpge:
+                                case Opcode::if_icmpgt:
+                                case Opcode::if_icmple:
+                                case Opcode::if_icmplt:
+                                case Opcode::if_icmpne:
+                                case Opcode::pop2:
+                                case Opcode::putfield:
+                                    stack.pop();
+                                    stack.pop();
+                                    break;
+                                case Opcode::aastore:
+                                case Opcode::bastore:
+                                case Opcode::castore:
+                                case Opcode::dastore:
+                                case Opcode::fastore:
+                                case Opcode::iastore:
+                                case Opcode::lastore:
+                                case Opcode::sastore:
+                                    stack.pop();
+                                    stack.pop();
+                                    stack.pop();
+                                    break;
+                                case Opcode::invokedynamic:
+                                case Opcode::invokestatic:
+                                {
+                                    ConstPool::Index mid = inst->invoke()->methodRefIndex;
+                                    string className, name, desc;
+                                    auto constpool = inst->constPool;
+                                    if (constpool->getTag(mid) == ConstPool::INTERMETHODREF) {
+                                        constpool->getInterMethodRef(mid, &className,
+                                            &name, &desc);
+                                    }
+                                    else {
+                                        constpool->getMethodRef(mid, &className,
+                                            &name, &desc);
+                                    }
+                                    auto arg = get_arg(desc);
+                                    for (auto _ : arg) {
+                                        stack.pop();
+                                    }
+                                    if (desc.substr(desc.size() - 2) != ")V") {
+                                        stack.push({ opcode,counter });
+                                    }
+                                    
+                                    break;
+                                }
+                                case Opcode::invokeinterface:
+                                case Opcode::invokespecial:
+                                case Opcode::invokevirtual:
+                                {
+                                    ConstPool::Index mid = inst->invoke()->methodRefIndex;
+                                    string className, name, desc;
+                                    auto constpool = inst->constPool;
+                                    if (constpool->getTag(mid) == ConstPool::INTERMETHODREF) {
+                                        constpool->getInterMethodRef(mid, &className,
+                                            &name, &desc);
+                                    }
+                                    else {
+                                        constpool->getMethodRef(mid, &className,
+                                            &name, &desc);
+                                    }
+
+                                    auto arg = get_arg(desc);
+                                    for (auto _ : arg) {
+                                        stack.pop();
+                                    }
+                                    stack.pop();
+                                    if (desc.substr(desc.size() - 2) != ")V"){
+                                        stack.push({ opcode,counter });
+                                    }
+                                    break;
+                                }
+                                case Opcode::multianewarray:
+                                    ConstPool::Index type = inst->multiarray()->classIndex;
+                                    u1 dims = inst->multiarray()->dims;
+                                    for (int _ = 0; _ < dims; _++) {
+                                        stack.pop();
+                                    }
+                                    stack.push({ opcode,counter });
+                                }
+
+                                if (counter == bytecode_offset.value()) {
+                                    break;
+                                }
+                                counter++;
+                            }
+
+
                             auto iterator = instList.begin();
-                            
                             for (size_t i = 0; i < bytecode_offset.value(); i++) {
                                 if (iterator->next == nullptr) {
                                     break;
@@ -585,7 +984,6 @@ ReapplyClass(jclass clazz, std::string clazz_name)
                     }
                 }
         }
-
         // Redefine class with modified ClassFile
         auto cf_bytes = cf->toBytes();
 
